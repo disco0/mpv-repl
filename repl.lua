@@ -1,37 +1,88 @@
--- repl.lua -- A graphical REPL for mpv input commands
 --
--- © 2016, James Ross-Gowan
+    -- repl.lua -- A graphical REPL for mpv input commands
+    --
+    -- 2016, James Ross-Gowan
+    --
+    -- Permission to use, copy, modify, and/or distribute this software for any
+    -- purpose with or without fee is hereby granted, provided that the above
+    -- copyright notice and this permission notice appear in all copies.
+    --
+    -- THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+    -- WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+    -- MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+    -- SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+    -- WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+    -- OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+    -- CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 --
--- Permission to use, copy, modify, and/or distribute this software for any
--- purpose with or without fee is hereby granted, provided that the above
--- copyright notice and this permission notice appear in all copies.
---
--- THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
--- WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
--- MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
--- SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
--- WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
--- OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
--- CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
-local utils = require 'mp.utils'
+require 'set'
+require 'tablemerge'
+local utils   = require 'mp.utils'
 local options = require 'mp.options'
 local assdraw = require 'mp.assdraw'
+local etc     = require 'repl++'
 
 -- Default options
-local opts = {
-	-- All drawing is scaled by this value, including the text borders and the
-	-- cursor. Change it if you have a high-DPI display.
-	scale = 1,
-	-- Set the font used for the REPL and the console. This probably doesn't
-	-- have to be a monospaced font.
-	font = 'monospace',
-	-- Set the font size used for the REPL and the console. This will be
-	-- multiplied by "scale."
-	['font-size'] = 16,
+-- [repl++] opts no longer local, might not be necessary now though
+opts = {
+  -- All drawing is scaled by this value, including the text borders and the
+  -- cursor. Change it if you have a high-DPI display.
+	scale     = 1,
+	scale_mac = 2,
+    scale_win = 1,    
+  -- [repl++] added options for repl view x,y offsets
+  --  Ideally: Parallel to geometry's <[W[xH]][+-x+-y]> in mpv proper
+  --      Atm: CSS style height/width/left/bottom values, in % of window or px
+  -- Defaults: Offsets to 0 and Width/Height to 100% for full screen
+    term_left   = '0',
+    term_bottom = '0',
+    term_height = '0',
+    term_width  = '0',
+  -- Set the font used for the REPL and the console. This probably doesn't
+  -- have to be a monospaced font.
+  -- [repl++] added default font values for macOS and Windows
+	font     = 'monospace',
+	font_win = 'Hasklig',
+	font_mac = 'Hasklig',
+  -- Set the font size used for the REPL and the console. This will be
+  -- multiplied by "scale.""
+  -- [repl++] variable name changed for convenience
+    font_size = 16,
+    log_ignore = { 'osd', 'cache', 'vap', 'ffm' }
+    -- macros = {
+    --     "sharpscale" = 'print-text "[sharp] oversample <-> linear (triangle) <-> catmull_rom <-> mitchell <-> gaussian <-> bicubic [smooth]"'
+    --     "font"       = 'script-message repl-size; script-message repl-font'
+    -- }
 }
 
+
+
+-- [repl++] Using auto-profiles method for detecting platform (can't get this to work on my mac)
+
 function detect_platform()
+    local function exec(process)
+        p_ret = utils.subprocess({args = process})
+        if p_ret.error and p_ret.error == "init" then
+            msg.error("executable not found: " .. process[1])
+        end
+        return p_ret
+    end
+    
+    if type(package)            == 'table'  and 
+       type(package.config)     == 'string' and 
+       package.config:sub(1, 1) == '\\'         then return 'windows'
+    else
+        local uname = exec({"uname"})
+        
+        if      uname.stdout == "Linux\n"  then return "linux" 
+        elseif  uname.stdout == "Darwin\n" then return "macos"
+        else    msg.error("platform detection ambiguous")
+        end
+    end
+end
+
+function detect_platform_old()
 	local o = {}
 	-- Kind of a dumb way of detecting the platform but whatever
 	if mp.get_property_native('options/vo-mmcss-profile', o) ~= o then
@@ -42,37 +93,51 @@ function detect_platform()
 	return 'linux'
 end
 
--- Pick a better default font for Windows and macOS
-local platform = detect_platform()
-if platform == 'windows' then
-	opts.font = 'Consolas'
-elseif platform == 'macos' then
-	opts.font = 'Menlo'
-end
-
 -- Apply user-set options
 options.read_options(opts)
+
+--[repl++] Process log_ignore options into set
+log_ignore = opts.log_ignore
+
+--[repl++] Allow scale change based on platform (this shouldn't be needed?)
+-- ..
+
+-- Pick a better default font for Windows and macOS
+local platform = detect_platform()
+
+if platform == 'windows' then
+	opts.font  = opts.font_win
+	opts.scale = opts.scale_win
+elseif platform == 'macos' then
+	opts.font  = opts.font_mac
+	opts.scale = opts.scale_mac
+end
+
 
 -- Build a list of commands, properties and options for tab-completion
 local option_info = {
 	'name', 'type', 'set-from-commandline', 'set-locally', 'default-value',
 	'min', 'max', 'choices',
 }
+
+--[repl++] sorted for convenience
 local cmd_list = {
-	'ignore', 'seek', 'revert-seek', 'quit', 'quit-watch-later', 'stop',
-	'frame-step', 'frame-back-step', 'playlist-next', 'playlist-prev',
-	'playlist-shuffle', 'sub-step', 'sub-seek', 'osd', 'print-text',
-	'show-text', 'show-progress', 'sub-add', 'sub-remove', 'sub-reload',
-	'tv-last-channel', 'screenshot', 'screenshot-to-file', 'screenshot-raw',
-	'loadfile', 'loadlist', 'playlist-clear', 'playlist-remove',
-	'playlist-move', 'run', 'set', 'add', 'cycle', 'multiply', 'cycle-values',
-	'enable-section', 'disable-section', 'define-section', 'ab-loop',
-	'drop-buffers', 'af', 'af-command', 'ao-reload', 'vf', 'vf-command',
-	'script-binding', 'script-message', 'script-message-to', 'overlay-add',
-	'overlay-remove', 'write-watch-later-config', 'hook-add', 'hook-ack',
-	'mouse', 'keypress', 'keydown', 'keyup', 'audio-add', 'audio-remove',
-	'audio-reload', 'rescan-external-file', 'apply-profile', 'load-script',
+	'ab-loop', 'add', 'af-command', 'af', 'ao-reload',
+	'apply-profile', 'audio-add', 'audio-reload', 'audio-remove',
+	'cycle-values', 'cycle', 'define-section', 'disable-section',
+	'drop-buffers', 'enable-section','frame-back-step', 'frame-step',
+	'hook-ack', 'hook-add', 'ignore','keydown', 'keypress', 'keyup',
+	'load-script', 'loadfile', 'loadlist', 'mouse', 'multiply', 'osd',
+	'overlay-add', 'overlay-remove', 'playlist-clear', 'playlist-move',
+	'playlist-next', 'playlist-prev', 'playlist-remove', 'playlist-shuffle',
+	'rescan-external-file', 'revert-seek', 'run', 'screenshot-raw',
+	'screenshot-to-file','print-text', 'quit-watch-later', 'quit', 
+	'script-message-to', 'script-message', 'seek', 'set', 'show-progress',
+	'screenshot', 'script-binding', 'show-text', 'stop', 'sub-add',
+	'sub-reload', 'sub-remove', 'sub-seek', 'sub-step', 'tv-last-channel',
+	'vf-command', 'vf', 'write-watch-later-config',
 }
+
 local prop_list = mp.get_property_native('property-list')
 for _, opt in ipairs(mp.get_property_native('options')) do
 	prop_list[#prop_list + 1] = 'options/' .. opt
@@ -82,6 +147,10 @@ for _, opt in ipairs(mp.get_property_native('options')) do
 		prop_list[#prop_list + 1] = 'option-info/' .. opt .. '/' .. p
 	end
 end
+
+--[repl++]: Concat prop_list with cmd_list for monolithic autocompleter
+    cmd_list = merge(cmd_list, prop_list)
+--
 
 local repl_active = false
 local insert_mode = false
@@ -129,18 +198,18 @@ function update()
 	local style = '{\\r' ..
 	               '\\1a&H00&\\3a&H00&\\4a&H99&' ..
 	               '\\1c&Heeeeee&\\3c&H111111&\\4c&H000000&' ..
-	               '\\fn' .. opts.font .. '\\fs' .. opts['font-size'] ..
+	               '\\fn' .. opts.font .. '\\fs' .. opts.font_size ..
 	               '\\bord2\\xshad0\\yshad1\\fsp0\\q1}'
 	-- Create the cursor glyph as an ASS drawing. ASS will draw the cursor
 	-- inline with the surrounding text, but it sets the advance to the width
 	-- of the drawing. So the cursor doesn't affect layout too much, make it as
 	-- thin as possible and make it appear to be 1px wide by giving it 0.5px
 	-- horizontal borders.
-	local cheight = opts['font-size'] * 8
+	local cheight = opts.font_size * 8
 	local cglyph = '{\\r' ..
-	                '\\1a&H44&\\3a&H44&\\4a&H99&' ..
-	                '\\1c&Heeeeee&\\3c&Heeeeee&\\4c&H000000&' ..
-	                '\\xbord0.5\\ybord0\\xshad0\\yshad1\\p4\\pbo24}' ..
+	               '\\1a&H44&\\3a&H44&\\4a&H99&' ..
+	               '\\1c&Heeeeee&\\3c&Heeeeee&\\4c&H000000&' ..
+	               '\\xbord0.5\\ybord0\\xshad0\\yshad1\\p4\\pbo24}' ..
 	               'm 0 0 l 1 0 l 1 ' .. cheight .. ' l 0 ' .. cheight ..
 	               '{\\p0}'
 	local before_cur = ass_escape(line:sub(1, cursor - 1))
@@ -150,7 +219,7 @@ function update()
 	-- messages.
 	local log_ass = ''
 	local log_messages = #log_ring
-	local log_max_lines = math.ceil(screeny / opts['font-size'])
+	local log_max_lines = math.ceil(screeny / opts.font_size)
 	if log_max_lines < log_messages then
 		log_messages = log_max_lines
 	end
@@ -293,16 +362,19 @@ function maybe_exit()
 end
 
 -- Run the current command and clear the line (Enter)
+--[repl++] Added extended macro expansion function
 function handle_enter()
 	if line == '' then
 		return
-	end
-	if history[#history] ~= line then
+    end
+	line = etc.eval_line(line) or line  --[repl++] Hands over to repl++ function
+    if history[#history] ~= line then  
 		history[#history + 1] = line
 	end
 
-	mp.command(line)
-	clear()
+    mp.command(line)
+    update()
+    clear()
 end
 
 -- Go to the specified position in the command history
@@ -380,18 +452,31 @@ end
 --   append: An extra string to be appended to the end of a successful
 --           completion. It is only appended if 'list' contains exactly one
 --           match.
+-- local completers = {
+-- 	{ pattern = '^%s*()[%w_-]+()$', list = cmd_list, append = ' ' },
+-- 	{ pattern = '^%s*set%s+()[%w_/-]+()$', list = prop_list, append = ' ' },
+-- 	{ pattern = '^%s*set%s+"()[%w_/-]+()$', list = prop_list, append = '" ' },
+-- 	{ pattern = '^%s*add%s+()[%w_/-]+()$', list = prop_list, append = ' ' },
+-- 	{ pattern = '^%s*add%s+"()[%w_/-]+()$', list = prop_list, append = '" ' },
+-- 	{ pattern = '^%s*cycle%s+()[%w_/-]+()$', list = prop_list, append = ' ' },
+-- 	{ pattern = '^%s*cycle%s+"()[%w_/-]+()$', list = prop_list, append = '" ' },
+-- 	{ pattern = '^%s*multiply%s+()[%w_/-]+()$', list = prop_list, append = ' ' },
+-- 	{ pattern = '^%s*multiply%s+"()[%w_/-]+()$', list = prop_list, append = '" ' },
+-- 	{ pattern = '${()[%w_/-]+()$', list = prop_list, append = '}' },
+-- }
 local completers = {
 	{ pattern = '^%s*()[%w_-]+()$', list = cmd_list, append = ' ' },
-	{ pattern = '^%s*set%s+()[%w_/-]+()$', list = prop_list, append = ' ' },
-	{ pattern = '^%s*set%s+"()[%w_/-]+()$', list = prop_list, append = '" ' },
-	{ pattern = '^%s*add%s+()[%w_/-]+()$', list = prop_list, append = ' ' },
-	{ pattern = '^%s*add%s+"()[%w_/-]+()$', list = prop_list, append = '" ' },
-	{ pattern = '^%s*cycle%s+()[%w_/-]+()$', list = prop_list, append = ' ' },
-	{ pattern = '^%s*cycle%s+"()[%w_/-]+()$', list = prop_list, append = '" ' },
-	{ pattern = '^%s*multiply%s+()[%w_/-]+()$', list = prop_list, append = ' ' },
-	{ pattern = '^%s*multiply%s+"()[%w_/-]+()$', list = prop_list, append = '" ' },
-	{ pattern = '${()[%w_/-]+()$', list = prop_list, append = '}' },
+	{ pattern = '^%s*set%s+()[%w_/-]+()$', list = cmd_list, append = ' ' },
+	{ pattern = '^%s*set%s+"()[%w_/-]+()$', list = cmd_list, append = '" ' },
+	{ pattern = '^%s*add%s+()[%w_/-]+()$', list = cmd_list, append = ' ' },
+	{ pattern = '^%s*add%s+"()[%w_/-]+()$', list = cmd_list, append = '" ' },
+	{ pattern = '^%s*cycle%s+()[%w_/-]+()$', list = cmd_list, append = ' ' },
+	{ pattern = '^%s*cycle%s+"()[%w_/-]+()$', list = cmd_list, append = '" ' },
+	{ pattern = '^%s*multiply%s+()[%w_/-]+()$', list = cmd_list, append = ' ' },
+	{ pattern = '^%s*multiply%s+"()[%w_/-]+()$', list = cmd_list, append = '" ' },
+	{ pattern = '${()[%w_/-]+()$', list = cmd_list, append = '}' },
 }
+
 
 -- Use 'list' to find possible tab-completions for 'part.' Returns the longest
 -- common prefix of all the matching list items and a flag that indicates
@@ -420,6 +505,12 @@ function complete_match(part, list)
 	return completion, full_match
 end
 
+-- function list_completions(part, list)
+-- 	local before_cur = line:sub(1, cursor - 1)
+--     local after_cur = line:sub(cursor)
+    
+-- end
+
 -- Complete the option or property at the cursor (TAB)
 function complete()
 	local before_cur = line:sub(1, cursor - 1)
@@ -447,7 +538,7 @@ function complete()
 				-- completer.append to the final string. This is normally a
 				-- space or a quotation mark followed by a space.
 				if full and completer.append then
-					c = c .. completer.append
+                    c = c .. completer.append
 				end
 
 				-- Insert the completion and update
@@ -460,6 +551,47 @@ function complete()
 		end
 	end
 end
+---
+    function complete()
+        local before_cur = line:sub(1, cursor - 1)
+        local after_cur = line:sub(cursor)
+
+        -- Try the first completer that works
+        for _, completer in ipairs(completers) do
+            -- Completer patterns should return the start and end of the word to be
+            -- completed as the first and second capture groups
+            local _, _, s, e = before_cur:find(completer.pattern)
+            if not s then
+                -- Multiple input commands can be separated by semicolons, so all
+                -- completions that are anchored at the start of the string with
+                -- '^' can start from a semicolon as well. Replace ^ with ; and try
+                -- to match again.
+                _, _, s, e = before_cur:find(completer.pattern:gsub('^^', ';'))
+            end
+            if s then
+                -- If the completer's pattern found a word, check the completer's
+                -- list for possible completions
+                local part = before_cur:sub(s, e)
+                local c, full = complete_match(part, completer.list)
+                if c then
+                    -- If there was only one full match from the list, add
+                    -- completer.append to the final string. This is normally a
+                    -- space or a quotation mark followed by a space.
+                    if full and completer.append then
+                        c = c .. completer.append
+                    end
+
+                    -- Insert the completion and update
+                    before_cur = before_cur:sub(1, s - 1) .. c
+                    cursor = before_cur:len() + 1
+                    line = before_cur .. after_cur
+                    update()
+                    return
+                end
+            end
+        end
+    end
+---
 
 -- Move the cursor to the beginning of the line (HOME)
 function go_home()
@@ -562,62 +694,71 @@ end
 -- Hence, this function manually creates an input section and puts a list of
 -- bindings in it.
 function add_repl_bindings(bindings)
-	local cfg = ''
-	for i, binding in ipairs(bindings) do
-		local key = binding[1]
-		local fn = binding[2]
-		local name = '__repl_binding_' .. i
-		mp.add_key_binding(nil, name, fn, 'repeatable')
-		cfg = cfg .. key .. ' script-binding ' .. mp.script_name .. '/' ..
-		      name .. '\n'
-	end
-	mp.commandv('define-section', 'repl-input', cfg, 'force')
+    local cfg = ''
+    for i, binding in ipairs(bindings) do
+        local key = binding[1]
+        local fn = binding[2]
+        local name = '__repl_binding_' .. i
+        mp.add_key_binding(nil, name, fn, 'repeatable')
+        cfg = cfg .. key .. ' script-binding ' .. mp.script_name .. '/' ..
+            name .. '\n'
+    end
+    mp.commandv('define-section', 'repl-input', cfg, 'force')
 end
 
 -- Mapping from characters to mpv key names
 local binding_name_map = {
-	[' '] = 'SPACE',
-	['#'] = 'SHARP',
+    [' '] = 'SPACE',
+    ['#'] = 'SHARP',
 }
 
 -- List of input bindings. This is a weird mashup between common GUI text-input
 -- bindings and readline bindings.
 local bindings = {
-	{ 'esc',         function() set_active(false) end       },
-	{ 'enter',       handle_enter                           },
-	{ 'shift+enter', function() handle_char_input('\n') end },
-	{ 'bs',          handle_backspace                       },
-	{ 'shift+bs',    handle_backspace                       },
-	{ 'del',         handle_del                             },
-	{ 'shift+del',   handle_del                             },
-	{ 'ins',         handle_ins                             },
-	{ 'shift+ins',   function() paste(false) end            },
-	{ 'mouse_btn1',  function() paste(false) end            },
-	{ 'left',        function() prev_char() end             },
-	{ 'right',       function() next_char() end             },
-	{ 'up',          function() move_history(-1) end        },
-	{ 'axis_up',     function() move_history(-1) end        },
-	{ 'mouse_btn3',  function() move_history(-1) end        },
-	{ 'down',        function() move_history(1) end         },
-	{ 'axis_down',   function() move_history(1) end         },
-	{ 'mouse_btn4',  function() move_history(1) end         },
-	{ 'axis_left',   function() end                         },
-	{ 'axis_right',  function() end                         },
-	{ 'ctrl+left',   prev_word                              },
-	{ 'ctrl+right',  next_word                              },
-	{ 'tab',         complete                               },
-	{ 'home',        go_home                                },
-	{ 'end',         go_end                                 },
-	{ 'pgup',        handle_pgup                            },
-	{ 'pgdwn',       handle_pgdown                          },
-	{ 'ctrl+c',      clear                                  },
-	{ 'ctrl+d',      maybe_exit                             },
-	{ 'ctrl+k',      del_to_eol                             },
-	{ 'ctrl+l',      clear_log_buffer                       },
-	{ 'ctrl+u',      del_to_start                           },
-	{ 'ctrl+v',      function() paste(true) end             },
-	{ 'meta+v',      function() paste(true) end             },
-	{ 'ctrl+w',      del_word                               },
+    { 'esc',         function() set_active(false) end       		},
+    { 'enter',       handle_enter                           		},
+    { 'shift+enter', function() handle_char_input('\n') end 		},
+    { 'bs',          handle_backspace                       		},
+    { 'shift+bs',    handle_backspace                       		},
+    { 'del',         handle_del                             		},
+    { 'shift+del',   handle_del                             		},
+    { 'ins',         handle_ins                             		},
+    { 'shift+ins',   function() paste(false) end            		},
+    { 'mouse_btn1',  function() paste(false) end            		},
+    { 'left',        function() prev_char() end             		},
+    { 'right',       function() next_char() end             		},
+    { 'up',          function() move_history(-1) end        		},
+    { 'axis_up',     function() move_history(-1) end        		},
+    { 'mouse_btn3',  function() move_history(-1) end        		},
+    { 'down',        function() move_history(1) end         		},
+    { 'axis_down',   function() move_history(1) end         		},
+    { 'mouse_btn4',  function() move_history(1) end         		},
+    { 'axis_left',   function() end                         		},
+    { 'axis_right',  function() end                         		},
+    { 'ctrl+left',   prev_word                              		},
+    { 'ctrl+right',  next_word                              		},
+    { 'tab',         complete                               		},
+    { 'home',        go_home                                		},
+    { 'end',         go_end                                 		},
+    { 'pgup',        handle_pgup                            		},
+    { 'pgdwn',       handle_pgdown                          		},
+    { 'ctrl+c',      clear                                  		},
+    { 'ctrl+d',      maybe_exit                             		},
+    { 'ctrl+k',      del_to_eol                             		},
+    { 'ctrl+l',      clear_log_buffer                       		},
+    { 'ctrl+u',      del_to_start                           		},
+    { 'ctrl+v',      function() paste(true) end             		},
+    { 'meta+v',      function() paste(true) end             		},
+    { 'ctrl+w',      del_word                                       },
+
+    --[repl++] bindings using repl++ functions
+    { 'ctrl+p',     function()
+                        etc.cons_line("print-text ${", line, "}")
+                        update()
+                    end          								    },
+    { 'ctrl+f',     function() etc.print_line(line)  end            },
+    { 'ctrl+s',     function() etc.cons_line("set ") end            },
+    { 'ctrl+x',		function() etc.cycle_line(line)  end            }
 }
 -- Add bindings for all the printable US-ASCII characters from ' ' to '~'
 -- inclusive. Note, this is a pretty hacky way to do text input. mpv's input
@@ -635,12 +776,78 @@ add_repl_bindings(bindings)
 -- will take over and it can be closed with ESC.
 mp.add_key_binding('`', 'repl-enable', function()
 	set_active(true)
-end)
+end)  
 
 -- Add a script-message to show the REPL and fill it with the provided text
 mp.register_script_message('type', function(text)
-	show_and_type(text)
+    show_and_type(text)
 end)
+
+
+local etc = require "repl++"
+
+-- repl++ script bindings --
+  -- Show/Set REPL Font Size
+   -- OLD - Separate getter/setter functions
+    mp.register_script_message('repl-size', function(text)
+        etc.get_REPL_font_size()
+    end)
+    mp.register_script_message('set-repl-size', function(text)
+        etc.set_REPL_font_size(text)
+    end)
+   --
+   -- NEW - Single getter/setter function changes based on input
+    mp.register_script_message('term-size', function(text)
+        if text then etc.set_REPL_font_size(text) 
+                else etc.get_REPL_font_size() 
+        end    
+    end)
+
+  -- Show/Set REPL Font
+   -- OLD - Separate getter/setter functions
+    mp.register_script_message('repl-font', function(text)
+        etc.get_REPL_font_name()
+    end)
+    mp.register_script_message('set-repl-font', function(text)
+        etc.set_REPL_font_name(text)
+    end)
+   --
+   -- NEW - Single getter/setter function changes based on input
+    mp.register_script_message('term-font', function(text)
+        if text then etc.set_REPL_font_name(text) 
+                else etc.get_REPL_font_name() 
+        end    
+    end)
+
+  -- List (read: spew) current session log message 
+    mp.register_script_message('print-ignores', function(text)
+        log_add('{\\1c&H66ccff&}', "log_ignore => " .. opts.font_size .. "\n")
+    end)
+
+  -- List (read: spew) audio devices
+    mp.register_script_message('print-devices', function(text) 
+        etc.audio_devices() 
+    end)
+
+  -- A/V Device Explorer
+    mp.register_script_message('devices', function(text)
+        etc.device_info(text)
+    end)
+
+  -- Exit repl (for calling in macro [TODO: less clunky way])
+    mp.register_script_message('repl-hide', function()
+        set_active(false)
+    end)
+
+  -- List available macros
+    mp.register_script_message('macros', function()
+        etc.macro_list()
+    end)
+  -- Call debug etc function
+    mp.register_script_message('dbg', function(text)
+        etc.dbg_etc(text)
+    end)
+--
 
 -- Redraw the REPL when the OSD size changes. This is needed because the
 -- PlayRes of the OSD will need to be adjusted.
@@ -651,11 +858,21 @@ mp.observe_property('osd-height', 'native', update)
 mp.enable_messages('info')
 mp.register_event('log-message', function(e)
 	-- Ignore log messages from the OSD because of paranoia, since writing them
-	-- to the OSD could generate more messages in an infinite loop.
-	if e.prefix:sub(1, 3) == 'osd' then return end
+    -- to the OSD could generate more messages in an infinite loop.
+    
+    -- Iterate through log_ignore list 
+    for i, v  in ipairs(log_ignore) do 
+       if e.prefix:sub(1, #v) == v then return end
+    end
+	-- if e.prefix:sub(1, 3) == 'osd' then return end
+	-- if e.prefix:sub(1, 5) == 'cache' then return end
+	-- if e.prefix:sub(1, 3) == 'vap' then return end
+	-- -- [repl++] added to filter SVP errors, intend to add ability to add log
+	-- -- message filters (e.g. 'ffm' is just to remove ffmpeg errors)
+	-- if e.prefix:sub(1, 3) == 'ffm' then return end
 
-	-- Use color for warn/error/fatal messages. Colors are stolen from base16
-	-- Eighties by Chris Kempson.
+-- Use color for warn/error/fatal messages. Colors are stolen from base16
+-- Eighties by Chris Kempson.
 	local style = ''
 	if e.level == 'warn' then
 		style = '{\\1c&H66ccff&}'
@@ -663,8 +880,13 @@ mp.register_event('log-message', function(e)
 		style = '{\\1c&H7a77f2&}'
 	elseif e.level == 'fatal' then
 		style = '{\\1c&H5791f9&\\b1}'
-	end
+    end
 
-	log_add(style, '[' .. e.prefix .. '] ' .. e.text)
-	update()
+    if e.prefix == 'cplayer' then
+        -- log_add(style, '] ' .. e.text) -- Fallback incase space first isn't possible
+	    log_add(style, ass_escape("  ") .. e.text)
+    else
+	    log_add(style, '[' .. e.prefix .. '] ' .. e.text)
+    end
 end)
+
